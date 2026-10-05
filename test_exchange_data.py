@@ -2,6 +2,7 @@
 Run: python test_exchange_data.py
 """
 import tempfile
+import types
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -17,6 +18,7 @@ BSE_HEADER = ("TradDt,BizDt,Sgmt,Src,FinInstrmTp,FinInstrmId,ISIN,TckrSymb,SctyS
               "FinInstrmNm,OpnPric,HghPric,LwPric,ClsPric,LastPric,PrvsClsgPric,"
               "TtlTradgVol\n")
 
+_NO_SLEEP = types.SimpleNamespace(sleep=lambda *_: None)   # affects exchange_data only
 TODAY = date(2026, 10, 5)
 HOLIDAY = date(2026, 9, 25)         # weekday with no file (404)
 SPLIT_DAY = date(2026, 9, 16)       # 2-for-1 split ex-date for AAA
@@ -102,7 +104,7 @@ def test_pipeline_split_and_holiday():
     with_tmp_cache()
     fake = make_http(560)
     ex._http_get = fake
-    ex.time.sleep = lambda *_: None
+    ex.time = _NO_SLEEP
     daily, failed = ex.load_days("NSE", 560, today=TODAY)
     assert failed == [], failed
     days, raw = price_path(560)
@@ -125,7 +127,7 @@ def test_pipeline_split_and_holiday():
 def test_failed_day_not_used_for_adjustment():
     with_tmp_cache()
     ex._http_get = make_http(560)
-    ex.time.sleep = lambda *_: None
+    ex.time = _NO_SLEEP
     daily, _ = ex.load_days("NSE", 560, today=TODAY)
     # Simulate a missing day (download failed) and make sure no bogus factor appears
     gap = date(2026, 8, 12)
@@ -149,20 +151,77 @@ def test_blocked_site_raises():
     raise AssertionError("should have raised")
 
 
-def test_bse_resolution_and_isin_dedupe():
-    with_tmp_cache()
-    ex._http_get = make_http(40)
-    ex.time.sleep = lambda *_: None
-    bse_daily, _ = ex.load_days("BSE", 40, today=TODAY)
-    uni, unmatched = ex.resolve_bse(["500001", "bbb2", "999999"], bse_daily)
-    assert set(uni["symbol"]) == {"AAA", "BBB2"} and unmatched == ["999999"], (uni, unmatched)
-    nse = pd.DataFrame({"symbol": ["AAA"], "name": ["AAA LTD"], "key": ["NSE:AAA"],
-                        "ISIN": ["INE000A01011"], "index": ["NSE 200"]})
-    merged = ex.merge_universe(nse, uni)
-    assert len(merged) == 2, merged                            # AAA once, BBB2 kept
-    assert merged.loc[merged["symbol"] == "AAA", "index"].iloc[0] == "NSE 200 + BSE 200"
-    assert merged.loc[merged["symbol"] == "AAA", "key"].iloc[0] == "NSE:AAA"
-    print("BSE resolve + ISIN dedupe OK")
+def _patch_lists_and_clock():
+    tmp = with_tmp_cache()
+    ex.NSE_CACHE_LIST = tmp / "nse.csv"
+    ex.BSE_FILE = tmp / "bse.csv"
+    ex.NSE_CACHE_LIST.write_text(
+        "Company Name,Industry,Symbol,Series,ISIN Code\n"
+        "AAA LTD,X,AAA,EQ,INE000A01011\nBBB LTD,X,BBB,EQ,INE000B01099\n")
+    ex.BSE_FILE.write_text(
+        "Scrip Code,COMPANY,ISIN No.,Close Price\n"
+        "500001,AAA LTD,INE000A01011,10\n"
+        "500002,BBB TWO LTD,INE000B01011,20\n"
+        "500003,GHOST LTD,INE000C01011,30\n")
+    ex._http_get = make_http(560)
+    ex.time = _NO_SLEEP
+    import datetime
+
+    class D(datetime.date):
+        @classmethod
+        def today(cls):
+            return TODAY
+    ex.date = D
+
+
+def test_modes():
+    from scan import run_scan
+    from screener import Params
+    _patch_lists_and_clock()
+
+    uni, px, info = ex.prepare("NSE")
+    assert list(uni["key"]) == ["NSE:AAA", "NSE:BBB"] and set(px) == {"NSE:AAA", "NSE:BBB"}
+    assert set(uni["index"]) == {"NSE 200"}
+
+    uni, px, info = ex.prepare("BSE")
+    assert len(uni) == 3 and set(uni["index"]) == {"BSE 200"}
+    assert set(px) == {"BSE:500001", "BSE:500002"}                 # BSE prices only
+    assert uni.set_index("key").loc["BSE:500001", "symbol"] == "AAA"   # ticker from BSE file
+    assert any("500003" in w for w in info["warnings"]), info["warnings"]   # missing stock reported
+
+    uni, px, info = ex.prepare("BOTH")
+    idx = uni.set_index("symbol")["index"].to_dict()
+    assert idx == {"AAA": "NSE 200 + BSE 200", "BBB": "NSE 200 only",
+                   "BBB2": "BSE 200 only", "500003": "BSE 200 only"}, idx
+    assert set(px) == {"NSE:AAA", "NSE:BBB", "BSE:500002"}          # NSE data for dual-listed
+    print("modes NSE / BSE / BOTH OK")
+
+    # BSE site blocked in BOTH mode: NSE results still returned, with a warning
+    real = ex._http_get
+    ex._http_get = lambda url, *a, **k: (_ for _ in ()).throw(ex.FetchError("HTTP 403")) \
+        if "bseindia" in url else real(url, *a, **k)
+    for d in ex.CACHE["BSE"].glob("*"):
+        d.unlink()
+    uni, px, info = ex.prepare("BOTH")
+    assert set(uni["key"]) == {"NSE:AAA", "NSE:BBB"} and any("BSE data could not" in w for w in info["warnings"])
+    try:
+        ex.prepare("BSE")
+    except ex.FetchError:
+        print("BSE blocked: BOTH degrades gracefully, BSE mode errors OK")
+        return
+    raise AssertionError("BSE mode should raise when BSE is unreachable")
+
+
+def test_real_lists_overlap():
+    """Uses the bundled data/nse200.csv and data/bse200.csv (the files supplied by the client)."""
+    real = Path(__file__).parent / "data"
+    ex.NSE_CACHE_LIST, ex.BSE_FILE = real / "nse200.csv", real / "bse200.csv"
+    nse, bse = ex.load_nse200(False), ex.load_bse200_file()
+    assert len(nse) == 200 and len(bse) == 200
+    cmp = ex.compare_indices(nse, bse)
+    assert (len(cmp["both"]), len(cmp["bse_only"]), len(cmp["nse_only"])) == (175, 25, 25)
+    assert "500488" in set(cmp["bse_only"]["code"])               # Abbott India: BSE 200 only
+    print("real lists: 175 common / 25 BSE-only / 25 NSE-only OK")
 
 
 if __name__ == "__main__":
@@ -171,4 +230,5 @@ if __name__ == "__main__":
     test_pipeline_split_and_holiday()
     test_failed_day_not_used_for_adjustment()
     test_blocked_site_raises()
-    test_bse_resolution_and_isin_dedupe()
+    test_modes()
+    test_real_lists_overlap()

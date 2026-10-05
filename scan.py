@@ -1,8 +1,9 @@
 """Run the screener over a universe. Usable from the app or the command line:
 
-    python scan.py                 # NSE 200 + BSE 200 (BSE list from data/bse200.csv)
-    python scan.py --no-bse        # NSE 200 only
-    python scan.py --min-score 3   # CSV output threshold
+    python scan.py                  # NSE 200 (NSE prices)
+    python scan.py --index bse      # BSE 200 (BSE prices)
+    python scan.py --index both     # both lists together
+    python scan.py --min-score 3    # CSV output threshold
 """
 from __future__ import annotations
 
@@ -46,13 +47,12 @@ def run_scan(universe: pd.DataFrame, params: Params, prices: dict):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--no-nse", action="store_true")
-    ap.add_argument("--no-bse", action="store_true")
+    ap.add_argument("--index", choices=["nse", "bse", "both"], default="nse")
     ap.add_argument("--min-score", type=int, default=3)
     ap.add_argument("--out", default="scan_results.csv")
     a = ap.parse_args()
 
-    uni, prices, info = prepare(use_nse=not a.no_nse, use_bse=not a.no_bse,
+    uni, prices, info = prepare(a.index,
                                 progress=lambda f, t: print(f"  {t}      ", end="\r"))
     print(f"\nUniverse: {len(uni)} unique stocks · data as of {info['last_date']:%d %b %Y}")
     for w in info["warnings"]:

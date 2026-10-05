@@ -254,6 +254,7 @@ def build_prices(daily: pd.DataFrame, keys, failed_days=()) -> dict[str, pd.Data
 # Stock lists
 # --------------------------------------------------------------------------
 def load_nse200(refresh: bool = False) -> pd.DataFrame:
+    """NSE 200 constituents (data/nse200.csv; refreshed from NSE on request)."""
     if refresh or not NSE_CACHE_LIST.exists():
         raw, last = None, "no response"
         for url in NSE200_URLS:
@@ -283,103 +284,130 @@ def load_nse200(refresh: bool = False) -> pd.DataFrame:
     })[UNIVERSE_COLS]
 
 
-def read_bse_tokens(extra_text: str | None = None) -> list[str]:
-    tokens: list[str] = []
-    if BSE_FILE.exists():
-        df = pd.read_csv(BSE_FILE, dtype=str)
-        if len(df.columns):
-            col = next((c for c in df.columns if c.strip().lower() == "symbol"), df.columns[0])
-            tokens += df[col].dropna().astype(str).tolist()
-    if extra_text:
-        tokens += [s for s in extra_text.replace(",", "\n").splitlines()]
-    seen, out = set(), []
-    for t in (x.strip() for x in tokens):
-        if t and t.lower() != "symbol" and t.upper() not in seen:
-            seen.add(t.upper())
-            out.append(t)
-    return out
+def _pick(df: pd.DataFrame, *needles: str):
+    for c in df.columns:
+        if any(n in c.lower() for n in needles):
+            return c
+    return None
 
 
-def resolve_bse(tokens: list[str], bse_daily: pd.DataFrame):
-    """Match scrip codes / tickers to BSE instruments. Returns (universe, unmatched)."""
-    meta = (bse_daily.sort_values("Date")
-            .drop_duplicates("Key", keep="last")[["Key", "Ticker", "ISIN", "Name"]].copy())
-    meta["Code"] = meta["Key"].str.replace("BSE:", "", regex=False)
-    by_code = meta.set_index("Code")
-    by_tick = meta.drop_duplicates("Ticker").set_index(meta.drop_duplicates("Ticker")["Ticker"].str.upper())
-    rows, unmatched = [], []
-    for t in tokens:
-        if t in by_code.index:
-            r = by_code.loc[t]
-        elif t.upper() in by_tick.index:
-            r = by_tick.loc[t.upper()]
-        else:
-            unmatched.append(t)
-            continue
-        rows.append({"symbol": r["Ticker"], "name": r["Name"], "key": r["Key"],
-                     "ISIN": r["ISIN"], "index": "BSE 200"})
-    uni = pd.DataFrame(rows, columns=UNIVERSE_COLS).drop_duplicates("key")
-    return uni, unmatched
+def load_bse200_file() -> pd.DataFrame:
+    """BSE 200 constituents from data/bse200.csv (BSE's own constituents file).
+    Needs a scrip-code column; company name and ISIN columns are used if present.
+    Returns DataFrame[code, name, ISIN]."""
+    if not BSE_FILE.exists():
+        raise FetchError(f"BSE 200 list not found. Save BSE's constituents file as {BSE_FILE}.")
+    df = pd.read_csv(BSE_FILE, dtype=str)
+    df.columns = [c.strip() for c in df.columns]
+    code_c = _pick(df, "scrip", "security code")
+    if code_c is None or df.empty:
+        raise FetchError(
+            f"{BSE_FILE.name} has no BSE 200 stocks. It should be BSE's constituents file "
+            "with columns such as 'Scrip Code', 'COMPANY' and 'ISIN No.'.")
+    name_c, isin_c = _pick(df, "company", "name"), _pick(df, "isin")
+    out = pd.DataFrame({
+        "code": df[code_c].str.strip(),
+        "name": df[name_c].str.strip() if name_c else df[code_c].str.strip(),
+        "ISIN": df[isin_c].str.strip() if isin_c else "",
+    })
+    return out.dropna(subset=["code"]).drop_duplicates("code").reset_index(drop=True)
+
+
+def bse_universe(file_df: pd.DataFrame, bse_daily: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Universe rows for BSE 200. Ticker and full name are taken from BSE's own
+    daily file when available."""
+    meta = None
+    if bse_daily is not None and len(bse_daily):
+        meta = (bse_daily.sort_values("Date").drop_duplicates("Key", keep="last")
+                .set_index("Key"))
+    rows = []
+    for _, r in file_df.iterrows():
+        key = f"BSE:{r['code']}"
+        m = meta.loc[key] if meta is not None and key in meta.index else None
+        tick = m["Ticker"] if m is not None and pd.notna(m["Ticker"]) and m["Ticker"] else r["code"]
+        name = m["Name"] if m is not None and pd.notna(m["Name"]) and m["Name"] else r["name"]
+        isin = r["ISIN"] if isinstance(r["ISIN"], str) and r["ISIN"] else (
+            m["ISIN"] if m is not None and isinstance(m["ISIN"], str) else "")
+        rows.append({"symbol": tick, "name": name, "key": key, "ISIN": isin, "index": "BSE 200"})
+    return pd.DataFrame(rows, columns=UNIVERSE_COLS)
 
 
 def merge_universe(nse: pd.DataFrame, bse: pd.DataFrame) -> pd.DataFrame:
-    """Same company on both exchanges (matched by ISIN) is kept once, on NSE."""
-    if nse.empty:
-        return bse.reset_index(drop=True)
-    if bse.empty:
-        return nse.reset_index(drop=True)
+    """'Both' mode. A company on both lists (matched by ISIN) is kept once, on NSE."""
     both = (set(nse["ISIN"]) & set(bse["ISIN"])) - {"", None}
     nse = nse.copy()
-    nse.loc[nse["ISIN"].isin(both), "index"] = "NSE 200 + BSE 200"
-    bse = bse[~bse["ISIN"].isin(both)]
+    nse["index"] = nse["ISIN"].map(lambda i: "NSE 200 + BSE 200" if i in both else "NSE 200 only")
+    bse = bse[~bse["ISIN"].isin(both)].copy()
+    bse["index"] = "BSE 200 only"
     return pd.concat([nse, bse], ignore_index=True).sort_values("symbol").reset_index(drop=True)
+
+
+def compare_indices(nse_uni: pd.DataFrame, bse_file: pd.DataFrame) -> dict:
+    """How the two lists differ, matched by ISIN."""
+    n_isin, b_isin = set(nse_uni["ISIN"]), set(bse_file["ISIN"])
+    return {
+        "both": nse_uni[nse_uni["ISIN"].isin(b_isin)][["symbol", "name", "ISIN"]].reset_index(drop=True),
+        "bse_only": bse_file[~bse_file["ISIN"].isin(n_isin)][["code", "name", "ISIN"]].reset_index(drop=True),
+        "nse_only": nse_uni[~nse_uni["ISIN"].isin(b_isin)][["symbol", "name", "ISIN"]].reset_index(drop=True),
+    }
 
 
 # --------------------------------------------------------------------------
 # One call for the app / CLI
 # --------------------------------------------------------------------------
-def prepare(use_nse=True, use_bse=True, bse_extra=None, refresh_nse=False,
-            days_back: int = 560, progress=None):
-    """Returns (universe, {key: OHLCV}, info)."""
+def prepare(mode: str = "NSE", refresh_nse: bool = False, days_back: int = 560, progress=None):
+    """mode: 'NSE' (NSE 200, NSE data), 'BSE' (BSE 200, BSE data) or
+    'BOTH' (union; NSE data for stocks on both lists, BSE data for BSE-only stocks).
+    Returns (universe, {key: OHLCV}, info)."""
+    mode = mode.upper()
+    if mode not in ("NSE", "BSE", "BOTH"):
+        raise ValueError("mode must be NSE, BSE or BOTH")
     info = {"warnings": [], "last_date": None, "failed_days": {}}
-    empty = pd.DataFrame(columns=UNIVERSE_COLS)
-    nse_uni, bse_uni = empty, empty
     prices: dict[str, pd.DataFrame] = {}
+    nse_uni = bse_uni = None
 
-    if use_nse:
+    if mode in ("NSE", "BOTH"):
         nse_uni = load_nse200(refresh_nse)
         daily, failed = load_days("NSE", days_back, progress)
         info["last_date"] = daily["Date"].max()
         info["failed_days"]["NSE"] = failed
         prices.update(build_prices(daily, nse_uni["key"], failed))
 
-    if use_bse:
-        tokens = read_bse_tokens(bse_extra)
-        if not tokens:
-            info["warnings"].append(
-                "BSE 200 is ticked but no BSE stocks are listed. Add scrip codes to "
-                "data/bse200.csv or paste them in the sidebar.")
-        else:
-            try:
-                daily, failed = load_days("BSE", days_back, progress)
-                info["failed_days"]["BSE"] = failed
-                bse_uni, unmatched = resolve_bse(tokens, daily)
-                if unmatched:
-                    info["warnings"].append(
-                        f"{len(unmatched)} BSE entries not found in the BSE file: "
-                        + ", ".join(unmatched[:10]) + (" …" if len(unmatched) > 10 else ""))
-                prices.update(build_prices(daily, bse_uni["key"], failed))
-                if info["last_date"] is None:
-                    info["last_date"] = daily["Date"].max()
-            except FetchError as e:
-                if not use_nse:
-                    raise
-                info["warnings"].append(f"BSE data skipped: {e}")
+    if mode in ("BSE", "BOTH"):
+        bse_file = load_bse200_file()
+        daily, failed = None, []
+        try:
+            daily, failed = load_days("BSE", days_back, progress)
+        except FetchError as e:
+            if mode == "BSE":
+                raise
+            info["warnings"].append(f"BSE data could not be downloaded, so the BSE-only stocks were not scanned. {e}")
+        bse_uni = bse_universe(bse_file, daily)
+        if daily is not None:
+            info["failed_days"]["BSE"] = failed
+            if info["last_date"] is None:
+                info["last_date"] = daily["Date"].max()
+            absent = bse_uni[~bse_uni["key"].isin(set(daily["Key"]))]
+            if len(absent):
+                info["warnings"].append(
+                    f"{len(absent)} BSE 200 stock(s) are not in BSE's latest price files "
+                    "(for example suspended or newly listed): " + ", ".join(absent["symbol"].head(8)))
+            want = bse_uni["key"] if mode == "BSE" else \
+                bse_uni[~bse_uni["ISIN"].isin(set(nse_uni["ISIN"]))]["key"]
+            prices.update(build_prices(daily, want, failed))
 
-    for ex, failed in info["failed_days"].items():
+    for exch, failed in info["failed_days"].items():
         if failed:
             info["warnings"].append(
-                f"{ex}: {len(failed)} day(s) could not be downloaded and were left out "
-                "(re-run to retry).")
+                f"{exch}: {len(failed)} day(s) could not be downloaded and were left out "
+                "(run the scan again to retry).")
 
-    return merge_universe(nse_uni, bse_uni), prices, info
+    if mode == "NSE":
+        uni = nse_uni
+    elif mode == "BSE":
+        uni = bse_uni
+    elif prices and "BSE" in info["failed_days"]:
+        uni = merge_universe(nse_uni, bse_uni)
+    else:                                   # BSE download failed in 'both' mode
+        uni = nse_uni
+    return uni.reset_index(drop=True), prices, info
