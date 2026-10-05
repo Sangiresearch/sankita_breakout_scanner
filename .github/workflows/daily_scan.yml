@@ -1,0 +1,7 @@
+@echo off
+cd /d "%~dp0"
+echo Running the daily scan... this can take several minutes the first time.
+"%LOCALAPPDATA%\Python\pythoncore-3.14-64\python.exe" daily_job.py
+echo.
+echo Finished. Results are saved in the results folder.
+pause
